@@ -1,0 +1,359 @@
+html
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Sortir à Lyon - Carte des événements</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  html, body { height: 100%; margin: 0; padding: 0; }
+  #map { height: 100%; width: 100%; }
+  .bottom-sheet {
+    transform: translateY(100%);
+    transition: transform 0.3s ease-out;
+  }
+  .bottom-sheet.open { transform: translateY(0); }
+  .filter-pill { transition: all 0.15s ease; }
+  .spinner {
+    border: 3px solid #e5e7eb;
+    border-top: 3px solid #4f46e5;
+    border-radius: 50%;
+    width: 24px; height: 24px;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body class="h-[100dvh] flex flex-col font-sans bg-gray-100 overflow-hidden">
+
+  <!-- HEADER + FILTRES -->
+  <header class="bg-white shadow-md z-20 px-3 pt-3 pb-2 flex-shrink-0">
+    <div class="flex items-center justify-between mb-2">
+      <h1 class="text-base font-bold text-gray-800 flex items-center gap-1">
+        <span>📍</span> Sortir à Lyon
+      </h1>
+      <div class="flex items-center gap-2 text-[11px] text-gray-500">
+        <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-green-500 inline-block"></span>Gratuit</span>
+        <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-indigo-600 inline-block"></span>Payant</span>
+      </div>
+    </div>
+    <div class="flex gap-2 overflow-x-auto pb-1 text-sm no-scrollbar">
+      <button data-filter="all" class="date-filter filter-pill px-3 py-1.5 rounded-full border whitespace-nowrap font-medium bg-indigo-600 text-white border-indigo-600">Tout</button>
+      <button data-filter="today" class="date-filter filter-pill px-3 py-1.5 rounded-full border whitespace-nowrap font-medium bg-white text-indigo-600 border-indigo-600">Aujourd'hui</button>
+      <button data-filter="weekend" class="date-filter filter-pill px-3 py-1.5 rounded-full border whitespace-nowrap font-medium bg-white text-indigo-600 border-indigo-600">Ce week-end</button>
+      <button id="freeBtn" class="filter-pill px-3 py-1.5 rounded-full border whitespace-nowrap font-medium bg-white text-green-600 border-green-600">🎁 Gratuit</button>
+    </div>
+  </header>
+
+  <!-- CARTE -->
+  <div class="relative flex-grow">
+    <div id="map"></div>
+
+    <!-- Barre de statut / chargement / erreur -->
+    <div id="statusBar" class="absolute top-3 left-1/2 -translate-x-1/2 bg-white shadow-md rounded-full px-4 py-1.5 text-xs text-gray-700 z-10 flex items-center gap-2 max-w-[90%] text-center">
+      <div class="spinner" id="spinner"></div>
+      <span id="statusText">Chargement des événements...</span>
+    </div>
+  </div>
+
+  <!-- OVERLAY -->
+  <div id="overlay" class="fixed inset-0 bg-black/40 z-[1000] hidden"></div>
+
+  <!-- BOTTOM SHEET -->
+  <div id="bottomSheet" class="bottom-sheet fixed bottom-0 left-0 right-0 bg-white rounded-t-2xl shadow-2xl z-[1010] p-4 pb-6 max-h-[65vh] overflow-y-auto">
+    <div class="w-10 h-1.5 bg-gray-300 rounded-full mx-auto mb-3"></div>
+    <button id="closeSheet" class="absolute top-3 right-3 text-gray-400 hover:text-gray-600 text-2xl leading-none px-2">✕</button>
+    <span id="sheetBadge" class="inline-block text-xs font-semibold px-2 py-1 rounded-full mb-2"></span>
+    <h2 id="sheetTitle" class="text-lg font-bold text-gray-900 pr-6 mb-3 leading-snug"></h2>
+    <div class="space-y-2 text-sm text-gray-700 mb-4">
+      <p class="flex gap-2"><span class="text-base">🗓️</span> <span id="sheetDate"></span></p>
+      <p class="flex gap-2"><span class="text-base">📍</span> <span id="sheetLocation"></span></p>
+      <p class="flex gap-2"><span class="text-base">💶</span> <span id="sheetPrice"></span></p>
+    </div>
+    <a id="sheetLink" href="#" target="_blank" rel="noopener noreferrer"
+       class="block text-center bg-indigo-600 text-white font-semibold py-2.5 rounded-xl active:bg-indigo-700">
+      Voir le site →
+    </a>
+  </div>
+
+<script>
+  // ---------- INIT CARTE ----------
+  const map = L.map('map', { zoomControl: true }).setView([45.7640, 4.8357], 13);
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors',
+    maxZoom: 19
+  }).addTo(map);
+
+  const markersLayer = L.layerGroup().addTo(map);
+
+  // ---------- ETAT ----------
+  let allEvents = [];
+  let currentDateFilter = 'all';
+  let freeOnly = false;
+
+  const statusBar = document.getElementById('statusBar');
+  const statusText = document.getElementById('statusText');
+  const spinner = document.getElementById('spinner');
+
+  // ---------- API OPENDATASOFT (Open Agenda - Lyon) ----------
+  const API_URL = "https://public.opendatasoft.com/api/explore/v2.1/catalog/datasets/evenements-publics-openagenda/records?"
+    + new URLSearchParams({
+        where: 'location_city="Lyon" and lastdate_end>=now()',
+        order_by: 'firstdate_begin asc',
+        limit: 50
+      }).toString();
+
+  // ---------- UTILITAIRES D'EXTRACTION ----------
+  function getField(rec, names) {
+    for (const n of names) {
+      if (rec[n] !== undefined && rec[n] !== null && rec[n] !== '') return rec[n];
+    }
+    return null;
+  }
+
+  function parseEvent(rec) {
+    const title = getField(rec, ['title_fr', 'title', 'name']) || "Événement sans titre";
+
+    // Coordonnées géographiques
+    let lat = null, lng = null;
+    const coords = getField(rec, ['location_coordinates', 'geo_point_2d', 'location_geo']);
+    if (coords) {
+      if (Array.isArray(coords) && coords.length === 2) {
+        lng = coords[0]; lat = coords[1];
+      } else if (typeof coords === 'object') {
+        lat = coords.lat ?? coords.latitude ?? null;
+        lng = coords.lon ?? coords.lng ?? coords.longitude ?? null;
+      }
+    }
+
+    const dateLabel = getField(rec, ['daterange_fr', 'nextdaterange_fr', 'lastdaterange_fr']);
+    const firstDate = getField(rec, ['firstdate_begin']);
+    const lastDate  = getField(rec, ['lastdate_end', 'lastdate_begin']);
+
+    const locationName    = getField(rec, ['location_name']);
+    const locationAddress = getField(rec, ['location_address']);
+    const location = [locationName, locationAddress].filter(Boolean).join(', ') || 'Lyon';
+
+    const price = getField(rec, ['conditions_fr', 'conditions', 'pricing_fr']) || "Tarif non précisé";
+    const link  = getField(rec, ['canonicalurl', 'link', 'originagenda_url']);
+
+    const isFree = /gratuit|free|0\s?€|0\s?euro/i.test(price);
+
+    return {
+      title,
+      lat: lat !== null ? parseFloat(lat) : null,
+      lng: lng !== null ? parseFloat(lng) : null,
+      dateLabel,
+      firstDate,
+      lastDate,
+      location,
+      price,
+      link,
+      isFree
+    };
+  }
+
+  // ---------- CHARGEMENT DES DONNEES ----------
+  async function loadEvents() {
+    showStatus("Chargement des événements...", true);
+    try {
+      const res = await fetch(API_URL);
+      if (!res.ok) throw new Error("Erreur HTTP " + res.status);
+
+      const data = await res.json();
+      const records = data.results || [];
+
+      allEvents = records
+        .map(parseEvent)
+        .filter(e => e.lat !== null && e.lng !== null && !isNaN(e.lat) && !isNaN(e.lng));
+
+      if (allEvents.length === 0) {
+        showStatus("Aucun événement géolocalisé trouvé à Lyon pour le moment.", false);
+      } else {
+        applyFilters();
+      }
+    } catch (err) {
+      console.error("Erreur de récupération des données :", err);
+      showStatus("⚠️ Impossible de charger les événements (API indisponible). Réessayez plus tard.", false);
+    }
+  }
+
+  function showStatus(msg, loading) {
+    statusText.textContent = msg;
+    spinner.style.display = loading ? 'inline-block' : 'none';
+    statusBar.classList.remove('hidden');
+  }
+
+  function hideStatusSoon() {
+    setTimeout(() => statusBar.classList.add('hidden'), 2200);
+  }
+
+  // ---------- FILTRES DE DATE ----------
+  function getTodayRange() {
+    const now = new Date();
+    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+    const end   = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
+    return [start, end];
+  }
+
+  function getWeekendRange() {
+    const now = new Date();
+    const day = now.getDay(); // 0 = dimanche, 6 = samedi
+    let offsetToSaturday;
+    if (day === 6) offsetToSaturday = 0;
+    else if (day === 0) offsetToSaturday = -1;
+    else offsetToSaturday = 6 - day;
+
+    const saturday = new Date(now);
+    saturday.setDate(now.getDate() + offsetToSaturday);
+    saturday.setHours(0, 0, 0, 0);
+
+    const sunday = new Date(saturday);
+    sunday.setDate(saturday.getDate() + 1);
+    sunday.setHours(23, 59, 59, 999);
+
+    return [saturday, sunday];
+  }
+
+  function eventOverlapsRange(ev, rangeStart, rangeEnd) {
+    if (!ev.firstDate) return true; // si pas de date connue, on ne l'exclut pas
+    const start = new Date(ev.firstDate);
+    const end = ev.lastDate ? new Date(ev.lastDate) : start;
+    if (isNaN(start.getTime())) return true;
+    const realEnd = isNaN(end.getTime()) ? start : end;
+    return start <= rangeEnd && realEnd >= rangeStart;
+  }
+
+  // ---------- APPLICATION DES FILTRES ----------
+  function applyFilters() {
+    let filtered = allEvents;
+
+    if (currentDateFilter === 'today') {
+      const [s, e] = getTodayRange();
+      filtered = filtered.filter(ev => eventOverlapsRange(ev, s, e));
+    } else if (currentDateFilter === 'weekend') {
+      const [s, e] = getWeekendRange();
+      filtered = filtered.filter(ev => eventOverlapsRange(ev, s, e));
+    }
+
+    if (freeOnly) {
+      filtered = filtered.filter(ev => ev.isFree);
+    }
+
+    renderMarkers(filtered);
+
+    const count = filtered.length;
+    showStatus(count + " événement" + (count !== 1 ? "s" : "") + " affiché" + (count !== 1 ? "s" : ""), false);
+    hideStatusSoon();
+  }
+
+  // ---------- AFFICHAGE DES MARQUEURS ----------
+  function renderMarkers(events) {
+    markersLayer.clearLayers();
+    events.forEach(ev => {
+      const color = ev.isFree ? '#16a34a' : '#4f46e5';
+      const marker = L.circleMarker([ev.lat, ev.lng], {
+        radius: 9,
+        fillColor: color,
+        color: '#ffffff',
+        weight: 2,
+        opacity: 1,
+        fillOpacity: 0.9
+      });
+      marker.on('click', () => openSheet(ev));
+      marker.addTo(markersLayer);
+    });
+  }
+
+  // ---------- FORMAT DE DATE ----------
+  function formatDate(ev) {
+    if (ev.dateLabel && typeof ev.dateLabel === 'string' && !/^\d{4}-\d{2}-\d{2}/.test(ev.dateLabel)) {
+      return ev.dateLabel;
+    }
+    if (ev.firstDate) {
+      const d = new Date(ev.firstDate);
+      if (!isNaN(d.getTime())) {
+        return d.toLocaleDateString('fr-FR', {
+          weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit'
+        });
+      }
+    }
+    return "Date non précisée";
+  }
+
+  // ---------- BOTTOM SHEET ----------
+  const bottomSheet = document.getElementById('bottomSheet');
+  const overlay = document.getElementById('overlay');
+  const sheetLink = document.getElementById('sheetLink');
+  const sheetBadge = document.getElementById('sheetBadge');
+
+  function openSheet(ev) {
+    document.getElementById('sheetTitle').textContent = ev.title;
+    document.getElementById('sheetDate').textContent = formatDate(ev);
+    document.getElementById('sheetLocation').textContent = ev.location;
+    document.getElementById('sheetPrice').textContent = ev.price;
+
+    if (ev.isFree) {
+      sheetBadge.textContent = "Gratuit";
+      sheetBadge.className = "inline-block text-xs font-semibold px-2 py-1 rounded-full mb-2 bg-green-100 text-green-700";
+    } else {
+      sheetBadge.textContent = "Payant";
+      sheetBadge.className = "inline-block text-xs font-semibold px-2 py-1 rounded-full mb-2 bg-indigo-100 text-indigo-700";
+    }
+
+    if (ev.link) {
+      sheetLink.href = ev.link;
+      sheetLink.classList.remove('hidden');
+    } else {
+      sheetLink.classList.add('hidden');
+    }
+
+    bottomSheet.classList.add('open');
+    overlay.classList.remove('hidden');
+  }
+
+  function closeSheet() {
+    bottomSheet.classList.remove('open');
+    overlay.classList.add('hidden');
+  }
+
+  document.getElementById('closeSheet').addEventListener('click', closeSheet);
+  overlay.addEventListener('click', closeSheet);
+
+  // ---------- ECOUTEURS DE FILTRES ----------
+  document.querySelectorAll('.date-filter').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.date-filter').forEach(b => {
+        b.classList.remove('bg-indigo-600', 'text-white');
+        b.classList.add('bg-white', 'text-indigo-600');
+      });
+      btn.classList.remove('bg-white', 'text-indigo-600');
+      btn.classList.add('bg-indigo-600', 'text-white');
+
+      currentDateFilter = btn.dataset.filter;
+      applyFilters();
+    });
+  });
+
+  document.getElementById('freeBtn').addEventListener('click', (e) => {
+    freeOnly = !freeOnly;
+    const btn = e.currentTarget;
+    if (freeOnly) {
+      btn.classList.remove('bg-white', 'text-green-600');
+      btn.classList.add('bg-green-600', 'text-white');
+    } else {
+      btn.classList.remove('bg-green-600', 'text-white');
+      btn.classList.add('bg-white', 'text-green-600');
+    }
+    applyFilters();
+  });
+
+  // ---------- LANCEMENT ----------
+  loadEvents();
+</script>
+</body>
+</html>
